@@ -200,7 +200,7 @@ def required_latest_data_date(
 
     try:
         return _required_latest_data_date_a_trade_calendar(data_cfg, now=now_local)
-    except (ImportError, AttributeError, ValueError, TypeError) as exc:
+    except (ImportError, AttributeError, IndexError, ValueError, TypeError) as exc:
         logger.warning("Falling back to business-day latest data date because a-trade-calendar failed: %s", exc)
 
     return _required_latest_data_date_business_day(data_cfg, now=now_local)
@@ -245,12 +245,41 @@ def _required_latest_data_date_a_trade_calendar(data_cfg: dict, now: datetime | 
     cutoff_hour = int(data_cfg.get("latest_data_cutoff_hour", 20))
     today = now_local.normalize().tz_localize(None)
     today_text = today.strftime("%Y-%m-%d")
-    if a_trade_calendar.is_trade_date(today_text):
+    _ensure_a_trade_calendar_covers(a_trade_calendar, today)
+
+    today_is_trade = a_trade_calendar.is_trade_date(today_text)
+    if not today_is_trade:
+        next_trade = a_trade_calendar.get_next_trade_date(today_text, 1)
+        if next_trade is None:
+            raise ValueError(f"a-trade-calendar has no next trade date after {today_text}")
+
+    if today_is_trade:
         if now_local.hour < cutoff_hour:
             return pd.Timestamp(a_trade_calendar.get_pre_trade_date(today_text, 1)).normalize()
         return today
     latest = a_trade_calendar.get_pre_trade_date(today_text, 1)
     return pd.Timestamp(latest).normalize()
+
+
+def _ensure_a_trade_calendar_covers(a_trade_calendar: object, today: pd.Timestamp) -> None:
+    coverage_end = _a_trade_calendar_coverage_end(a_trade_calendar)
+    if coverage_end is not None and today > coverage_end:
+        raise ValueError(f"a-trade-calendar coverage ends at {coverage_end.date()}, before {today.date()}")
+
+
+def _a_trade_calendar_coverage_end(a_trade_calendar: object) -> pd.Timestamp | None:
+    calendar_util = getattr(a_trade_calendar, "calendar_util", None)
+    if calendar_util is not None:
+        calendar_df = getattr(calendar_util, "_a_trade_cal_df", None)
+        if calendar_df is not None and "dt" in getattr(calendar_df, "columns", []):
+            dates = pd.to_datetime(calendar_df["dt"], errors="coerce").dropna()
+            if not dates.empty:
+                return pd.Timestamp(dates.max()).normalize()
+        end_dt = getattr(calendar_util, "end_dt", None)
+        if end_dt is not None:
+            return pd.Timestamp(end_dt).normalize()
+
+    return None
 
 
 def _required_latest_data_date_business_day(data_cfg: dict, now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:

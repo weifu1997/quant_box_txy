@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -96,6 +98,44 @@ class TradeCalClient(FakeTushareClient):
         return super().call(api_name, params=params, fields=fields)
 
 
+class FailingTradeCalClient(FakeTushareClient):
+    def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
+        if api_name == "trade_cal":
+            raise RuntimeError("calendar unavailable")
+        return super().call(api_name, params=params, fields=fields)
+
+
+def fake_a_trade_calendar(trade_days: list[str], pre_exception: Exception | None = None) -> SimpleNamespace:
+    dates = sorted(pd.Timestamp(day).normalize() for day in trade_days)
+
+    def is_trade_date(dtime: str) -> bool:
+        return pd.Timestamp(dtime).normalize() in dates
+
+    def get_pre_trade_date(dtime: str, cnt: int = 1) -> str:
+        if pre_exception is not None:
+            raise pre_exception
+        target = pd.Timestamp(dtime).normalize()
+        previous = [day for day in dates if day < target]
+        return previous[-cnt].strftime("%Y-%m-%d")
+
+    def get_next_trade_date(dtime: str, cnt: int = 1) -> str | None:
+        target = pd.Timestamp(dtime).normalize()
+        future = [day for day in dates if day > target]
+        if len(future) < cnt:
+            return None
+        return future[cnt - 1].strftime("%Y-%m-%d")
+
+    return SimpleNamespace(
+        calendar_util=SimpleNamespace(
+            _a_trade_cal_df=pd.DataFrame({"dt": [day.strftime("%Y-%m-%d") for day in dates]}),
+            end_dt=dates[-1].strftime("%Y-%m-%d"),
+        ),
+        is_trade_date=is_trade_date,
+        get_pre_trade_date=get_pre_trade_date,
+        get_next_trade_date=get_next_trade_date,
+    )
+
+
 class DataFetcherTests(unittest.TestCase):
     def test_fetch_trade_calendar_normalizes_tushare_response(self) -> None:
         client = TradeCalClient()
@@ -120,35 +160,49 @@ class DataFetcherTests(unittest.TestCase):
         required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=TradeCalClient())
         self.assertEqual(required, pd.Timestamp("2024-01-03"))
 
-    def test_required_latest_data_date_falls_back_to_a_trade_calendar_on_holiday(self) -> None:
-        class FailingTradeCalClient(FakeTushareClient):
-            def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
-                if api_name == "trade_cal":
-                    raise RuntimeError("calendar unavailable")
-                return super().call(api_name, params=params, fields=fields)
+    def test_required_latest_data_date_uses_a_trade_calendar_previous_trade_day_before_cutoff(self) -> None:
+        calendar = fake_a_trade_calendar(["2024-01-02", "2024-01-03", "2024-01-05"])
 
-        required = required_latest_data_date({}, now=pd.Timestamp("2024-01-01 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+        with patch.dict(sys.modules, {"a_trade_calendar": calendar}):
+            required = required_latest_data_date({}, now=pd.Timestamp("2024-01-03 19:59", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+
+        self.assertEqual(required, pd.Timestamp("2024-01-02"))
+
+    def test_required_latest_data_date_uses_a_trade_calendar_same_trade_day_at_cutoff(self) -> None:
+        calendar = fake_a_trade_calendar(["2024-01-02", "2024-01-03", "2024-01-05"])
+
+        with patch.dict(sys.modules, {"a_trade_calendar": calendar}):
+            required = required_latest_data_date({}, now=pd.Timestamp("2024-01-03 20:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+
+        self.assertEqual(required, pd.Timestamp("2024-01-03"))
+
+    def test_required_latest_data_date_uses_a_trade_calendar_latest_open_day_on_holiday(self) -> None:
+        calendar = fake_a_trade_calendar(["2023-12-29", "2024-01-02", "2024-01-03", "2024-01-05"])
+
+        with patch.dict(sys.modules, {"a_trade_calendar": calendar}):
+            required = required_latest_data_date({}, now=pd.Timestamp("2024-01-01 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+
         self.assertEqual(required, pd.Timestamp("2023-12-29"))
 
-    def test_required_latest_data_date_falls_back_to_business_day_when_trade_cal_and_local_calendar_fail(self) -> None:
-        class FailingTradeCalClient(FakeTushareClient):
-            def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
-                if api_name == "trade_cal":
-                    raise RuntimeError("calendar unavailable")
-                return super().call(api_name, params=params, fields=fields)
+    def test_required_latest_data_date_falls_back_to_business_day_when_local_calendar_past_coverage(self) -> None:
+        calendar = fake_a_trade_calendar(["2024-01-02", "2024-01-03", "2024-01-05"])
 
-        with patch("src.data_fetcher._required_latest_data_date_a_trade_calendar", side_effect=ImportError("no local calendar")):
+        with patch.dict(sys.modules, {"a_trade_calendar": calendar}):
+            required = required_latest_data_date({}, now=pd.Timestamp("2024-01-08 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+
+        self.assertEqual(required, pd.Timestamp("2024-01-08"))
+
+    def test_required_latest_data_date_falls_back_to_business_day_when_local_calendar_raises_index_error(self) -> None:
+        calendar = fake_a_trade_calendar(["2024-01-02", "2024-01-03", "2024-01-05", "2024-01-08"], pre_exception=IndexError("out of bounds"))
+
+        with patch.dict(sys.modules, {"a_trade_calendar": calendar}):
             required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+
         self.assertEqual(required, pd.Timestamp("2024-01-05"))
 
-    def test_required_latest_data_date_falls_back_to_business_day_when_trade_cal_fails(self) -> None:
-        class FailingTradeCalClient(FakeTushareClient):
-            def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
-                if api_name == "trade_cal":
-                    raise RuntimeError("calendar unavailable")
-                return super().call(api_name, params=params, fields=fields)
-
-        required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+    def test_required_latest_data_date_falls_back_to_business_day_when_local_calendar_missing(self) -> None:
+        with patch("src.data_fetcher._required_latest_data_date_a_trade_calendar", side_effect=ImportError("no local calendar")):
+            required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
         self.assertEqual(required, pd.Timestamp("2024-01-05"))
 
     def test_hs300_universe_uses_hs300_constituents_not_mainboard_file(self) -> None:
