@@ -8,3 +8,4 @@ pyqlib>=0.9.4
 protobuf<4
 setuptools>=68,<70
 pytest>=8.0
+a-trade-calendar>=2026.2.13.1

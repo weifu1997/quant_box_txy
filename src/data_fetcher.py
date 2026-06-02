@@ -196,7 +196,12 @@ def required_latest_data_date(
         if required is not None:
             return required
     except (RuntimeError, ValueError, KeyError, TypeError) as exc:
-        logger.warning("Falling back to business-day latest data date because trade_cal failed: %s", exc)
+        logger.warning("Falling back to local A-share calendar because trade_cal failed: %s", exc)
+
+    try:
+        return _required_latest_data_date_a_trade_calendar(data_cfg, now=now_local)
+    except (ImportError, AttributeError, ValueError, TypeError) as exc:
+        logger.warning("Falling back to business-day latest data date because a-trade-calendar failed: %s", exc)
 
     return _required_latest_data_date_business_day(data_cfg, now=now_local)
 
@@ -223,6 +228,29 @@ def _required_latest_data_date_from_calendar(
             return None
         return pd.Timestamp(previous_open_days[-1]).normalize()
     return latest_open
+
+
+def _required_latest_data_date_a_trade_calendar(data_cfg: dict, now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:
+    try:
+        import a_trade_calendar
+    except ImportError:
+        raise
+
+    now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="Asia/Shanghai")
+    if now_ts.tzinfo is not None:
+        now_local = now_ts.tz_convert("Asia/Shanghai")
+    else:
+        now_local = now_ts.tz_localize("Asia/Shanghai")
+
+    cutoff_hour = int(data_cfg.get("latest_data_cutoff_hour", 20))
+    today = now_local.normalize().tz_localize(None)
+    today_text = today.strftime("%Y-%m-%d")
+    if a_trade_calendar.is_trade_date(today_text):
+        if now_local.hour < cutoff_hour:
+            return pd.Timestamp(a_trade_calendar.get_pre_trade_date(today_text, 1)).normalize()
+        return today
+    latest = a_trade_calendar.get_pre_trade_date(today_text, 1)
+    return pd.Timestamp(latest).normalize()
 
 
 def _required_latest_data_date_business_day(data_cfg: dict, now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:

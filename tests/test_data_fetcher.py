@@ -120,6 +120,27 @@ class DataFetcherTests(unittest.TestCase):
         required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=TradeCalClient())
         self.assertEqual(required, pd.Timestamp("2024-01-03"))
 
+    def test_required_latest_data_date_falls_back_to_a_trade_calendar_on_holiday(self) -> None:
+        class FailingTradeCalClient(FakeTushareClient):
+            def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
+                if api_name == "trade_cal":
+                    raise RuntimeError("calendar unavailable")
+                return super().call(api_name, params=params, fields=fields)
+
+        required = required_latest_data_date({}, now=pd.Timestamp("2024-01-01 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+        self.assertEqual(required, pd.Timestamp("2023-12-29"))
+
+    def test_required_latest_data_date_falls_back_to_business_day_when_trade_cal_and_local_calendar_fail(self) -> None:
+        class FailingTradeCalClient(FakeTushareClient):
+            def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
+                if api_name == "trade_cal":
+                    raise RuntimeError("calendar unavailable")
+                return super().call(api_name, params=params, fields=fields)
+
+        with patch("src.data_fetcher._required_latest_data_date_a_trade_calendar", side_effect=ImportError("no local calendar")):
+            required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+        self.assertEqual(required, pd.Timestamp("2024-01-05"))
+
     def test_required_latest_data_date_falls_back_to_business_day_when_trade_cal_fails(self) -> None:
         class FailingTradeCalClient(FakeTushareClient):
             def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
