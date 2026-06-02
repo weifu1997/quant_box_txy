@@ -28,6 +28,7 @@ DAILY_FIELDS = [
     "amount",
 ]
 ADJ_FACTOR_FIELDS = ["ts_code", "trade_date", "adj_factor"]
+TRADE_CAL_FIELDS = ["exchange", "cal_date", "is_open", "pretrade_date"]
 STOCK_BASIC_FIELDS = [
     "ts_code",
     "symbol",
@@ -136,6 +137,118 @@ class TushareHttpClient:
         if field_value:
             payload["fields"] = field_value
         return {"url": describe_endpoint(self.http_url), "timeout": self.timeout, "payload": payload}
+
+
+def fetch_trade_calendar(
+    start_date: str | datetime,
+    end_date: str | datetime,
+    client: TushareHttpClient | None = None,
+    exchange: str = "SSE",
+) -> pd.DataFrame:
+    client = client or TushareHttpClient.from_config()
+    params = {
+        "exchange": exchange,
+        "start_date": _format_tushare_date(start_date),
+        "end_date": _format_tushare_date(end_date),
+    }
+    df = client.call("trade_cal", params=params, fields=TRADE_CAL_FIELDS)
+    if df.empty:
+        return pd.DataFrame(columns=TRADE_CAL_FIELDS)
+    result = df.copy()
+    result["cal_date"] = pd.to_datetime(result["cal_date"].astype(str), format="%Y%m%d", errors="coerce")
+    if "pretrade_date" in result.columns:
+        result["pretrade_date"] = pd.to_datetime(result["pretrade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    result["is_open"] = pd.to_numeric(result["is_open"], errors="coerce").fillna(0).astype(int)
+    return result.dropna(subset=["cal_date"]).sort_values("cal_date").reset_index(drop=True)
+
+
+def required_latest_data_date(
+    data_cfg: dict,
+    now: datetime | pd.Timestamp | None = None,
+    client: TushareHttpClient | None = None,
+) -> pd.Timestamp:
+    """Return the minimum acceptable data date for a latest signal.
+
+    Tushare daily data is usually available in the evening after market close.
+    Before the cutoff hour on an open trading day, require data through the
+    previous trading day; at/after the cutoff, require data through that trading
+    day. On non-trading days, require the latest open trading day before today.
+    Falls back to business-day approximation if the Tushare calendar is not
+    available, so offline workflows still get a conservative check.
+    """
+    now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="Asia/Shanghai")
+    if now_ts.tzinfo is not None:
+        now_local = now_ts.tz_convert("Asia/Shanghai")
+    else:
+        now_local = now_ts.tz_localize("Asia/Shanghai")
+
+    cutoff_hour = int(data_cfg.get("latest_data_cutoff_hour", 20))
+    today = now_local.normalize().tz_localize(None)
+    calendar_lookback_days = int(data_cfg.get("trade_calendar_lookback_days", 45))
+    try:
+        calendar = fetch_trade_calendar(
+            today - pd.Timedelta(days=calendar_lookback_days),
+            today,
+            client=client,
+            exchange=str(data_cfg.get("trade_calendar_exchange", "SSE")),
+        )
+        required = _required_latest_data_date_from_calendar(calendar, today, now_local.hour, cutoff_hour)
+        if required is not None:
+            return required
+    except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("Falling back to business-day latest data date because trade_cal failed: %s", exc)
+
+    return _required_latest_data_date_business_day(data_cfg, now=now_local)
+
+
+def _required_latest_data_date_from_calendar(
+    calendar: pd.DataFrame,
+    today: pd.Timestamp,
+    current_hour: int,
+    cutoff_hour: int,
+) -> pd.Timestamp | None:
+    if calendar.empty or "cal_date" not in calendar.columns or "is_open" not in calendar.columns:
+        return None
+    cal = calendar.copy()
+    cal["cal_date"] = pd.to_datetime(cal["cal_date"]).dt.normalize()
+    cal["is_open"] = pd.to_numeric(cal["is_open"], errors="coerce").fillna(0).astype(int)
+    open_days = pd.DatetimeIndex(cal.loc[(cal["is_open"] == 1) & (cal["cal_date"] <= today), "cal_date"]).sort_values().unique()
+    if open_days.empty:
+        return None
+    latest_open = pd.Timestamp(open_days[-1]).normalize()
+    today_is_open = latest_open == today
+    if today_is_open and current_hour < cutoff_hour:
+        previous_open_days = open_days[open_days < today]
+        if previous_open_days.empty:
+            return None
+        return pd.Timestamp(previous_open_days[-1]).normalize()
+    return latest_open
+
+
+def _required_latest_data_date_business_day(data_cfg: dict, now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:
+    now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="Asia/Shanghai")
+    if now_ts.tzinfo is not None:
+        now_local = now_ts.tz_convert("Asia/Shanghai")
+    else:
+        now_local = now_ts.tz_localize("Asia/Shanghai")
+    cutoff_hour = int(data_cfg.get("latest_data_cutoff_hour", 20))
+    today = now_local.normalize().tz_localize(None)
+    latest_trading_day = _previous_or_same_business_day(today)
+    if today == latest_trading_day and now_local.hour < cutoff_hour:
+        return _previous_business_day(latest_trading_day)
+    return latest_trading_day
+
+
+def _previous_or_same_business_day(date: pd.Timestamp) -> pd.Timestamp:
+    date = pd.Timestamp(date).normalize()
+    while date.weekday() >= 5:
+        date -= pd.Timedelta(days=1)
+    return date
+
+
+def _previous_business_day(date: pd.Timestamp) -> pd.Timestamp:
+    date = pd.Timestamp(date).normalize() - pd.Timedelta(days=1)
+    return _previous_or_same_business_day(date)
 
 
 def fetch_daily_stock(

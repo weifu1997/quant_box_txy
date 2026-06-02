@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime
 
 import pandas as pd
 
 from src.config_loader import load_config, resolve_path
+from src.data_fetcher import required_latest_data_date
 from src.factor_calculator import load_or_compute_factors
 from src.scoring import build_strategy_scores
 from src.strategy import select_stocks
@@ -33,7 +33,7 @@ def generate_signal(
     data_cfg = config["data"]
     strategy_cfg = config["strategy"]
     use_latest_date = str(signal_date).lower() == "latest"
-    required_end_date = _required_latest_data_date(data_cfg) if use_latest_date else None
+    required_end_date = required_latest_data_date(data_cfg) if use_latest_date else None
     factor_end_date = required_end_date.strftime("%Y-%m-%d") if required_end_date is not None else signal_date
 
     factors = load_or_compute_factors(
@@ -86,41 +86,6 @@ def _latest_index_date(frame: pd.DataFrame | pd.Series, label: str) -> pd.Timest
     if not isinstance(frame.index, pd.MultiIndex):
         raise ValueError(f"Expected {label} data to use a MultiIndex of datetime/instrument.")
     return pd.Timestamp(frame.index.get_level_values(0).max()).normalize()
-
-
-def _required_latest_data_date(data_cfg: dict, now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:
-    """Return the minimum acceptable data date for a latest signal.
-
-    A-share daily data is typically available after the latest trading day's
-    close in the evening. Before the configured cutoff hour, require data up
-    to the previous trading day; at/after the cutoff, require the latest
-    trading day. This uses pandas business days as a lightweight trading-day
-    approximation; holidays can be handled later by wiring a market calendar.
-    """
-    now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="Asia/Shanghai")
-    if now_ts.tzinfo is not None:
-        now_local = now_ts.tz_convert("Asia/Shanghai")
-    else:
-        now_local = now_ts.tz_localize("Asia/Shanghai")
-
-    cutoff_hour = int(data_cfg.get("latest_data_cutoff_hour", 20))
-    today = now_local.normalize().tz_localize(None)
-    latest_trading_day = _previous_or_same_business_day(today)
-    if today == latest_trading_day and now_local.hour < cutoff_hour:
-        return _previous_business_day(latest_trading_day)
-    return latest_trading_day
-
-
-def _previous_or_same_business_day(date: pd.Timestamp) -> pd.Timestamp:
-    date = pd.Timestamp(date).normalize()
-    while date.weekday() >= 5:
-        date -= pd.Timedelta(days=1)
-    return date
-
-
-def _previous_business_day(date: pd.Timestamp) -> pd.Timestamp:
-    date = pd.Timestamp(date).normalize() - pd.Timedelta(days=1)
-    return _previous_or_same_business_day(date)
 
 
 def save_signal(signal_df: pd.DataFrame, holdings: list[str], signal_date: str, config: dict | None = None) -> tuple[Path, Path]:

@@ -11,7 +11,9 @@ from src.data_fetcher import (
     DAILY_FIELDS,
     fetch_daily_stocks,
     fetch_stock_universe,
+    fetch_trade_calendar,
     filter_universe_frame,
+    required_latest_data_date,
     update_daily_data,
     update_daily_data_resumable,
 )
@@ -79,7 +81,55 @@ class EmptyTushareClient(FakeTushareClient):
         raise AssertionError(f"Unexpected API call: {api_name}")
 
 
+class TradeCalClient(FakeTushareClient):
+    def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
+        self.calls.append((api_name, (params or {}).copy(), fields))
+        if api_name == "trade_cal":
+            return pd.DataFrame(
+                [
+                    {"exchange": "SSE", "cal_date": "20240101", "is_open": 0, "pretrade_date": "20231229"},
+                    {"exchange": "SSE", "cal_date": "20240102", "is_open": 1, "pretrade_date": "20231229"},
+                    {"exchange": "SSE", "cal_date": "20240103", "is_open": 1, "pretrade_date": "20240102"},
+                    {"exchange": "SSE", "cal_date": "20240106", "is_open": 0, "pretrade_date": "20240105"},
+                ]
+            )
+        return super().call(api_name, params=params, fields=fields)
+
+
 class DataFetcherTests(unittest.TestCase):
+    def test_fetch_trade_calendar_normalizes_tushare_response(self) -> None:
+        client = TradeCalClient()
+
+        calendar = fetch_trade_calendar("2024-01-01", "2024-01-03", client=client)
+
+        self.assertEqual(client.calls[0][0], "trade_cal")
+        self.assertEqual(client.calls[0][1]["start_date"], "20240101")
+        self.assertEqual(client.calls[0][1]["end_date"], "20240103")
+        self.assertEqual(calendar["cal_date"].tolist()[:2], [pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02")])
+        self.assertEqual(calendar["is_open"].tolist()[:2], [0, 1])
+
+    def test_required_latest_data_date_uses_previous_trade_day_before_cutoff(self) -> None:
+        required = required_latest_data_date({}, now=pd.Timestamp("2024-01-03 19:59", tz="Asia/Shanghai"), client=TradeCalClient())
+        self.assertEqual(required, pd.Timestamp("2024-01-02"))
+
+    def test_required_latest_data_date_uses_same_trade_day_at_cutoff(self) -> None:
+        required = required_latest_data_date({}, now=pd.Timestamp("2024-01-03 20:00", tz="Asia/Shanghai"), client=TradeCalClient())
+        self.assertEqual(required, pd.Timestamp("2024-01-03"))
+
+    def test_required_latest_data_date_uses_latest_open_day_on_non_trading_day(self) -> None:
+        required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=TradeCalClient())
+        self.assertEqual(required, pd.Timestamp("2024-01-03"))
+
+    def test_required_latest_data_date_falls_back_to_business_day_when_trade_cal_fails(self) -> None:
+        class FailingTradeCalClient(FakeTushareClient):
+            def call(self, api_name: str, params: dict | None = None, fields: list[str] | str | None = None) -> pd.DataFrame:
+                if api_name == "trade_cal":
+                    raise RuntimeError("calendar unavailable")
+                return super().call(api_name, params=params, fields=fields)
+
+        required = required_latest_data_date({}, now=pd.Timestamp("2024-01-06 21:00", tz="Asia/Shanghai"), client=FailingTradeCalClient())
+        self.assertEqual(required, pd.Timestamp("2024-01-05"))
+
     def test_hs300_universe_uses_hs300_constituents_not_mainboard_file(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
